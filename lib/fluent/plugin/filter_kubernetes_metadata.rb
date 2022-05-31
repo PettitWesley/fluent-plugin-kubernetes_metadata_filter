@@ -28,6 +28,7 @@ require_relative 'kubernetes_metadata_watch_pods'
 
 require 'fluent/plugin/filter'
 require 'resolv'
+require 'net/http'
 
 module Fluent::Plugin
   class KubernetesMetadataFilter < Fluent::Plugin::Filter
@@ -63,6 +64,7 @@ module Fluent::Plugin
     config_param :tag_to_kubernetes_name_regexp, :string, default: "(#{REGEX_VAR_LOG_PODS}|#{REGEX_VAR_LOG_CONTAINERS})"
 
     config_param :bearer_token_file, :string, default: nil
+    config_param :bearer_token_refresh, :integer, default: 3600
     config_param :secret_dir, :string, default: '/var/run/secrets/kubernetes.io/serviceaccount'
     config_param :de_dot, :bool, default: true
     config_param :de_dot_separator, :string, default: '_'
@@ -159,6 +161,7 @@ module Fluent::Plugin
     def initialize
       super
       @prev_time = Time.now
+      @bearer_token_last_refresh = current_unix_time()
     end
 
     def configure(conf)
@@ -255,8 +258,7 @@ module Fluent::Plugin
         auth_options = {}
 
         if present?(@bearer_token_file)
-          bearer_token = File.read(@bearer_token_file)
-          auth_options[:bearer_token] = bearer_token
+          auth_options[:bearer_token_file] = @bearer_token_file
         end
 
         log.debug 'Creating K8S client'
@@ -267,6 +269,7 @@ module Fluent::Plugin
           auth_options: auth_options,
           as: :parsed_symbolized
         )
+        @bearer_token_last_refresh = current_unix_time()
 
         if @test_api_adapter
           log.info "Extending client with test api adaper #{@test_api_adapter}"
@@ -334,6 +337,14 @@ module Fluent::Plugin
     def filter_stream(tag, es)
       return es if (es.respond_to?(:empty?) && es.empty?) || !es.is_a?(Fluent::EventStream)
       new_es = Fluent::MultiEventStream.new
+
+      if (@bearer_token_last_refresh + @bearer_token_refresh) < current_unix_time()
+        # calling this method instructs client to re-read bearer_token_file
+        # https://github.com/ManageIQ/kubeclient/blob/831e360772c717aab5ca086521c45c86ee51435e/lib/kubeclient.rb#L712
+        @client.http_options(@client.api_endpoint)
+        @bearer_token_last_refresh = current_unix_time()
+      end
+
       tag_match_data = tag.match(@tag_to_kubernetes_name_regexp_compiled) unless @use_journal
       tag_metadata = nil
       batch_miss_cache = {}
@@ -407,6 +418,11 @@ module Fluent::Plugin
         newref = ref.to_s.gsub('/', @de_slash_separator)
         h[newref] = v
       end
+    end
+
+
+    def current_unix_time
+      Time.now.to_i
     end
 
     # copied from activesupport
