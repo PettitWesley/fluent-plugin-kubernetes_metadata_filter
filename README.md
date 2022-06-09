@@ -41,6 +41,7 @@ Configuration options for fluent.conf are:
 * `client_cert` - path to a client cert file to authenticate to the API server
 * `client_key` - path to a client key file to authenticate to the API server
 * `bearer_token_file` - path to a file containing the bearer token to use for authentication
+* `bearer_token_refresh` - time in seconds to re-read and refresh bearer token. Default is 3600 (1 hour).
 * `tag_to_kubernetes_name_regexp` - the regular expression used to extract kubernetes metadata (pod name, container name, namespace) from the current fluentd tag.
 This must use named capture groups for `container_name`, `pod_name`, `namespace`, and either `pod_uuid (/var/log/pods)` or `docker_id (/var/log/containers)`
 * `cache_size` - size of the cache of Kubernetes metadata to reduce requests to the API server (default: `1000`)

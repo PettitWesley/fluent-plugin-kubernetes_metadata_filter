@@ -28,6 +28,7 @@ require_relative 'kubernetes_metadata_watch_pods'
 
 require 'fluent/plugin/filter'
 require 'resolv'
+require 'net/http'
 
 module Fluent::Plugin
   class KubernetesMetadataFilter < Fluent::Plugin::Filter
@@ -63,6 +64,7 @@ module Fluent::Plugin
     config_param :tag_to_kubernetes_name_regexp, :string, default: "(#{REGEX_VAR_LOG_PODS}|#{REGEX_VAR_LOG_CONTAINERS})"
 
     config_param :bearer_token_file, :string, default: nil
+    config_param :bearer_token_refresh, :integer, default: 3600
     config_param :secret_dir, :string, default: '/var/run/secrets/kubernetes.io/serviceaccount'
     config_param :de_dot, :bool, default: true
     config_param :de_dot_separator, :string, default: '_'
@@ -119,9 +121,23 @@ module Fluent::Plugin
       log.trace("parsed metadata for #{namespace_name}/#{pod_name}: #{metadata}")
       @cache[metadata['pod_id']] = metadata
     rescue StandardError => e
+      log.info("StandardError")
+      log.info(e)
+      log.info("e.message:")
+      log.info(e.message)
+      log.info("e.exception.full_message")
+      log.info(e.exception.full_message)
+      log.info("e.to_s")
+      log.info(e.to_s)
       @stats.bump(:pod_cache_api_nil_error)
-      log.debug "Exception '#{e}' encountered fetching pod metadata from Kubernetes API #{@apiVersion} endpoint #{@kubernetes_url}"
-      {}
+      if e.message == "Unauthorized"
+        @client = nil
+        # recreate client to refresh token
+        create_client()
+      else
+        log.debug "Exception '#{e}' encountered fetching pod metadata from Kubernetes API #{@apiVersion} endpoint #{@kubernetes_url}"
+        {}
+      end
     end
 
     def dump_stats
@@ -151,14 +167,31 @@ module Fluent::Plugin
       log.trace("parsed metadata for #{namespace_name}: #{metadata}")
       @namespace_cache[metadata['namespace_id']] = metadata
     rescue StandardError => e
-      @stats.bump(:namespace_cache_api_nil_error)
-      log.debug "Exception '#{e}' encountered fetching namespace metadata from Kubernetes API #{@apiVersion} endpoint #{@kubernetes_url}"
-      {}
+      log.info("StandardError")
+      log.info(e)
+      log.info("e.message:")
+      log.info(e.message)
+      log.info("e.exception.full_message")
+      log.info(e.exception.full_message)
+      log.info("e.to_s")
+      log.info(e.to_s)
+      if e.message == "Unauthorized"
+        @client = nil
+        # recreate client to refresh token
+        create_client()
+      else
+        @stats.bump(:namespace_cache_api_nil_error)
+        log.debug "Exception '#{e}' encountered fetching namespace metadata from Kubernetes API #{@apiVersion} endpoint #{@kubernetes_url}"
+        {}
+      end
     end
 
     def initialize
       super
       @prev_time = Time.now
+      @bearer_token_last_refresh = current_unix_time()
+      @ssl_options = {}
+      @auth_options = {}
     end
 
     def configure(conf)
@@ -194,6 +227,7 @@ module Fluent::Plugin
       
       @container_name_to_kubernetes_regexp_compiled = Regexp.compile(@container_name_to_kubernetes_regexp)
 
+      log.info 'Hiiii- Handle Unauthorized with refresh'
       # Use Kubernetes default service account if we're in a pod.
       if @kubernetes_url.nil?
         log.debug 'Kubernetes URL is not set - inspecting environ'
@@ -230,7 +264,7 @@ module Fluent::Plugin
       end
 
       if present?(@kubernetes_url)
-        ssl_options = {
+        @ssl_options = {
           client_cert: present?(@client_cert) ? OpenSSL::X509::Certificate.new(File.read(@client_cert)) : nil,
           client_key: present?(@client_key) ? OpenSSL::PKey::RSA.new(File.read(@client_key)) : nil,
           ca_file: @ca_file,
@@ -249,24 +283,16 @@ module Fluent::Plugin
                       0x80000
                     end
           ssl_store.flags = OpenSSL::X509::V_FLAG_CRL_CHECK_ALL | flagval
-          ssl_options[:cert_store] = ssl_store
+          @ssl_options[:cert_store] = ssl_store
         end
-
-        auth_options = {}
 
         if present?(@bearer_token_file)
-          bearer_token = File.read(@bearer_token_file)
-          auth_options[:bearer_token] = bearer_token
+          @auth_options[:bearer_token_file] = @bearer_token_file
         end
+        # auth_options[:bearer_token] = "DNE"
 
-        log.debug 'Creating K8S client'
-        @client = Kubeclient::Client.new(
-          @kubernetes_url,
-          @apiVersion,
-          ssl_options: ssl_options,
-          auth_options: auth_options,
-          as: :parsed_symbolized
-        )
+        create_client()
+        @bearer_token_last_refresh = current_unix_time()
 
         if @test_api_adapter
           log.info "Extending client with test api adaper #{@test_api_adapter}"
@@ -305,6 +331,17 @@ module Fluent::Plugin
       end
     end
 
+    def create_client()
+      log.info 'Creating K8S client'
+      @client = Kubeclient::Client.new(
+        @kubernetes_url,
+        @apiVersion,
+        ssl_options: @ssl_options,
+        auth_options: @auth_options,
+        as: :parsed_symbolized
+      )
+    end
+
     def get_metadata_for_record(namespace_name, pod_name, container_name, cache_key, create_time, batch_miss_cache, docker_id)
       metadata = {
         'docker' => { 'container_id' => "" },
@@ -334,6 +371,14 @@ module Fluent::Plugin
     def filter_stream(tag, es)
       return es if (es.respond_to?(:empty?) && es.empty?) || !es.is_a?(Fluent::EventStream)
       new_es = Fluent::MultiEventStream.new
+
+      # if (@bearer_token_last_refresh + @bearer_token_refresh) < current_unix_time()
+      #   # calling this method instructs client to re-read bearer_token_file
+      #   # https://github.com/ManageIQ/kubeclient/blob/831e360772c717aab5ca086521c45c86ee51435e/lib/kubeclient.rb#L712
+      #   @client.http_options(@client.api_endpoint)
+      #   @bearer_token_last_refresh = current_unix_time()
+      # end
+
       tag_match_data = tag.match(@tag_to_kubernetes_name_regexp_compiled) unless @use_journal
       tag_metadata = nil
       batch_miss_cache = {}
@@ -407,6 +452,11 @@ module Fluent::Plugin
         newref = ref.to_s.gsub('/', @de_slash_separator)
         h[newref] = v
       end
+    end
+
+
+    def current_unix_time
+      Time.now.to_i
     end
 
     # copied from activesupport
